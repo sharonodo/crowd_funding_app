@@ -865,3 +865,407 @@
 (define-read-only (get-campaign-updates (campaign-id uint))
     (default-to (list) (map-get? campaign-updates campaign-id))
 )
+
+;; Fee Management and Platform Controls
+
+;; Additional Constants
+(define-constant err-fee-too-high (err u122))
+(define-constant err-withdrawal-period-active (err u116))
+
+;; Fee and Admin Data Variables
+(define-data-var platform-fee uint u250) ;; 2.5% fee (250 basis points)
+(define-data-var fee-recipient principal contract-owner)
+(define-data-var total-platform-fees uint u0)
+
+;; Fee and Admin Data Maps
+(define-map campaign-fees
+    uint
+    uint
+)
+
+(define-map admin-permissions
+    principal
+    {
+        can-pause: bool,
+        can-set-fees: bool,
+        can-manage-governance: bool,
+    }
+)
+
+;; Enhanced Contribution with Fees
+(define-public (contribute-with-fees
+        (campaign-id uint)
+        (amount uint)
+    )
+    (let (
+            (campaign (unwrap! (map-get? campaigns campaign-id) err-not-found))
+            (fee-amount (/ (* amount (var-get platform-fee)) u10000))
+            (net-amount (- amount fee-amount))
+            (new-raised (+ (get raised campaign) net-amount))
+        )
+        (asserts! (> amount u0) err-invalid-amount)
+        (asserts! (is-campaign-active campaign-id) err-campaign-ended)
+
+        ;; Transfer full amount from contributor
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+
+        ;; Transfer fee to fee recipient if fee > 0
+        (if (> fee-amount u0)
+            (try! (as-contract (stx-transfer? fee-amount tx-sender (var-get fee-recipient))))
+            true
+        )
+
+        ;; Track fees
+        (var-set total-platform-fees (+ (var-get total-platform-fees) fee-amount))
+        (map-set campaign-fees campaign-id
+            (+ (get-campaign-fee campaign-id) fee-amount)
+        )
+
+        ;; Update contribution and campaign
+        (map-set contributions {
+            campaign-id: campaign-id,
+            contributor: tx-sender,
+        }
+            net-amount
+        )
+
+        (map-set campaigns campaign-id (merge campaign { raised: new-raised }))
+
+        ;; Check if goal reached with withdrawal delay
+        (if (>= new-raised (get goal campaign))
+            (map-set campaigns campaign-id
+                (merge campaign {
+                    raised: new-raised,
+                    status: "funded",
+                    withdrawal-ready-block: (+ stacks-block-height (var-get withdrawal-delay)),
+                })
+            )
+            true
+        )
+
+        (ok net-amount)
+    )
+)
+
+;; Admin Fee Management
+(define-public (set-platform-fee (new-fee uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= new-fee u1000) err-fee-too-high) ;; Max 10%
+
+        (var-set platform-fee new-fee)
+        (ok true)
+    )
+)
+
+(define-public (set-fee-recipient (new-recipient principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set fee-recipient new-recipient)
+        (ok true)
+    )
+)
+
+(define-public (withdraw-platform-fees (amount uint))
+    (let ((available-fees (var-get total-platform-fees)))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= amount available-fees) err-insufficient-funds)
+
+        (try! (as-contract (stx-transfer? amount tx-sender contract-owner)))
+        (var-set total-platform-fees (- available-fees amount))
+        (ok amount)
+    )
+)
+
+;; Admin Controls
+(define-public (set-admin-permissions
+        (admin principal)
+        (can-pause bool)
+        (can-set-fees bool)
+        (can-manage-governance bool)
+    )
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+
+        (map-set admin-permissions admin {
+            can-pause: can-pause,
+            can-set-fees: can-set-fees,
+            can-manage-governance: can-manage-governance,
+        })
+        (ok true)
+    )
+)
+
+;; Emergency Functions
+(define-public (emergency-pause (campaign-id uint))
+    (let ((campaign (unwrap! (map-get? campaigns campaign-id) err-not-found)))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set campaigns campaign-id (merge campaign { status: "paused" }))
+        (ok true)
+    )
+)
+
+(define-public (admin-pause-campaign (campaign-id uint))
+    (let (
+            (campaign (unwrap! (map-get? campaigns campaign-id) err-not-found))
+            (permissions (map-get? admin-permissions tx-sender))
+        )
+        (asserts!
+            (or
+                (is-eq tx-sender contract-owner)
+                (match permissions
+                    perms (get can-pause perms)
+                    false
+                )
+            )
+            err-owner-only
+        )
+
+        (map-set campaigns campaign-id (merge campaign { status: "paused" }))
+        (ok true)
+    )
+)
+
+;; Read-only functions for fees and admin
+(define-read-only (get-platform-fee)
+    (var-get platform-fee)
+)
+
+(define-read-only (get-total-platform-fees)
+    (var-get total-platform-fees)
+)
+
+(define-read-only (get-campaign-fee (campaign-id uint))
+    (default-to u0 (map-get? campaign-fees campaign-id))
+)
+
+(define-read-only (calculate-fee (amount uint))
+    (* amount (var-get platform-fee))
+)
+
+(define-read-only (get-admin-permissions (admin principal))
+    (map-get? admin-permissions admin)
+)
+
+;; Decentralized Governance System
+
+;; Governance Constants
+(define-constant err-voting-period-ended (err u117))
+(define-constant err-voting-period-active (err u118))
+(define-constant err-already-voted (err u119))
+(define-constant err-proposal-not-found (err u120))
+(define-constant err-insufficient-voting-power (err u121))
+
+;; Governance Data Variables
+(define-data-var governance-enabled bool false)
+(define-data-var proposal-counter uint u0)
+(define-data-var min-voting-power uint u1000000000) ;; 1000 STX minimum
+
+;; Governance Data Maps
+(define-map governance-proposals
+    uint
+    {
+        proposer: principal,
+        title: (string-ascii 100),
+        description: (string-ascii 500),
+        proposal-type: (string-ascii 50),
+        target-value: uint,
+        start-block: uint,
+        end-block: uint,
+        votes-for: uint,
+        votes-against: uint,
+        total-voting-power: uint,
+        executed: bool,
+    }
+)
+
+(define-map proposal-votes
+    {
+        proposal-id: uint,
+        voter: principal,
+    }
+    {
+        power: uint,
+        vote: bool,
+        block-height: uint,
+    }
+)
+
+(define-map user-voting-power
+    principal
+    uint
+)
+
+;; Governance Functions
+(define-public (create-governance-proposal
+        (title (string-ascii 100))
+        (description (string-ascii 500))
+        (proposal-type (string-ascii 50))
+        (target-value uint)
+        (voting-period uint)
+    )
+    (let (
+            (proposal-id (+ (var-get proposal-counter) u1))
+            (user-power (get-user-voting-power tx-sender))
+        )
+        (asserts! (var-get governance-enabled) err-unauthorized)
+        (asserts! (>= user-power (var-get min-voting-power))
+            err-insufficient-voting-power
+        )
+        (asserts! (> voting-period u0) err-invalid-duration)
+        (asserts! (<= voting-period u14400) err-invalid-duration)
+        ;; Max 100 days
+
+        (map-set governance-proposals proposal-id {
+            proposer: tx-sender,
+            title: title,
+            description: description,
+            proposal-type: proposal-type,
+            target-value: target-value,
+            start-block: stacks-block-height,
+            end-block: (+ stacks-block-height voting-period),
+            votes-for: u0,
+            votes-against: u0,
+            total-voting-power: u0,
+            executed: false,
+        })
+
+        (var-set proposal-counter proposal-id)
+        (ok proposal-id)
+    )
+)
+
+(define-public (vote-on-proposal
+        (proposal-id uint)
+        (vote bool)
+    )
+    (let (
+            (proposal (unwrap! (map-get? governance-proposals proposal-id)
+                err-proposal-not-found
+            ))
+            (user-power (get-user-voting-power tx-sender))
+            (existing-vote (map-get? proposal-votes {
+                proposal-id: proposal-id,
+                voter: tx-sender,
+            }))
+        )
+        (asserts! (var-get governance-enabled) err-unauthorized)
+        (asserts! (> user-power u0) err-insufficient-voting-power)
+        (asserts! (< stacks-block-height (get end-block proposal))
+            err-voting-period-ended
+        )
+        (asserts! (is-none existing-vote) err-already-voted)
+
+        ;; Record vote
+        (map-set proposal-votes {
+            proposal-id: proposal-id,
+            voter: tx-sender,
+        } {
+            power: user-power,
+            vote: vote,
+            block-height: stacks-block-height,
+        })
+
+        ;; Update proposal vote counts
+        (if vote
+            (map-set governance-proposals proposal-id
+                (merge proposal {
+                    votes-for: (+ (get votes-for proposal) user-power),
+                    total-voting-power: (+ (get total-voting-power proposal) user-power),
+                })
+            )
+            (map-set governance-proposals proposal-id
+                (merge proposal {
+                    votes-against: (+ (get votes-against proposal) user-power),
+                    total-voting-power: (+ (get total-voting-power proposal) user-power),
+                })
+            )
+        )
+
+        (ok true)
+    )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+    (let ((proposal (unwrap! (map-get? governance-proposals proposal-id)
+            err-proposal-not-found
+        )))
+        (asserts! (var-get governance-enabled) err-unauthorized)
+        (asserts! (>= stacks-block-height (get end-block proposal))
+            err-voting-period-active
+        )
+        (asserts! (not (get executed proposal)) err-proposal-not-found)
+        (asserts! (> (get votes-for proposal) (get votes-against proposal))
+            err-insufficient-voting-power
+        )
+
+        ;; Execute based on proposal type
+        (if (is-eq (get proposal-type proposal) "fee-change")
+            (begin
+                (asserts! (<= (get target-value proposal) u1000) err-fee-too-high)
+                (var-set platform-fee (get target-value proposal))
+                true
+            )
+            (if (is-eq (get proposal-type proposal) "delay-change")
+                (begin
+                    (var-set withdrawal-delay (get target-value proposal))
+                    true
+                )
+                true
+            )
+        )
+
+        ;; Mark as executed
+        (map-set governance-proposals proposal-id
+            (merge proposal { executed: true })
+        )
+        (ok true)
+    )
+)
+
+;; Governance Management
+(define-public (enable-governance)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set governance-enabled true)
+        (ok true)
+    )
+)
+
+(define-public (update-voting-power
+        (user principal)
+        (power uint)
+    )
+    (let ((permissions (unwrap! (map-get? admin-permissions tx-sender) err-unauthorized)))
+        (asserts!
+            (or (is-eq tx-sender contract-owner) (get can-manage-governance permissions))
+            err-owner-only
+        )
+
+        (map-set user-voting-power user power)
+        (ok true)
+    )
+)
+
+;; Governance Read-only Functions
+(define-read-only (get-governance-proposal (proposal-id uint))
+    (map-get? governance-proposals proposal-id)
+)
+
+(define-read-only (get-user-voting-power (user principal))
+    (default-to u0 (map-get? user-voting-power user))
+)
+
+(define-read-only (get-user-vote
+        (proposal-id uint)
+        (voter principal)
+    )
+    (map-get? proposal-votes {
+        proposal-id: proposal-id,
+        voter: voter,
+    })
+)
+
+(define-read-only (is-governance-enabled)
+    (var-get governance-enabled)
+)
