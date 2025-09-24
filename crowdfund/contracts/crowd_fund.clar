@@ -206,11 +206,6 @@
     (and
         (> (len title) u0)
         (<= (len title) max-title-length)
-        ;; Check for valid characters (no control characters)
-        (is-some (index-of
-            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,!?-_()[]{}"
-            (unwrap-panic (element-at title u0))
-        ))
     )
 )
 
@@ -456,6 +451,7 @@
         (asserts! (is-valid-goal goal) err-invalid-goal)
         (asserts! (is-valid-duration duration) err-invalid-duration)
         (asserts! (is-valid-category category) err-invalid-category)
+        (asserts! (<= (len tags) u200) err-invalid-category)
 
         ;; Update rate limiting
         (update-rate-limit tx-sender "campaign")
@@ -696,7 +692,7 @@
     )
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
-
+        (asserts! (<= level u5) err-invalid-amount) ;; Max verification level 5
         (map-set kyc-status user {
             verified: verified,
             verification-block: stacks-block-height,
@@ -762,6 +758,9 @@
         (asserts! (is-campaign-active campaign-id) err-campaign-ended)
         (asserts! (> target-amount u0) err-invalid-amount)
         (asserts! (< (len current-milestones) u10) err-extension-limit-exceeded)
+        (asserts! (<= (len title) u100) err-invalid-title)
+        (asserts! (<= (len description) u300) err-invalid-description)
+        (asserts! (> target-block stacks-block-height) err-invalid-duration)
 
         (map-set milestones milestone-id {
             campaign-id: campaign-id,
@@ -816,6 +815,7 @@
         )
         (asserts! (> contribution u0) err-insufficient-funds)
         (asserts! (is-campaign-active campaign-id) err-campaign-ended)
+        (asserts! (<= (len reason) u200) err-invalid-description)
 
         (map-set refund-requests {
             campaign-id: campaign-id,
@@ -986,7 +986,6 @@
     )
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
-
         (map-set admin-permissions admin {
             can-pause: can-pause,
             can-set-fees: can-set-fees,
@@ -1020,7 +1019,6 @@
             )
             err-owner-only
         )
-
         (map-set campaigns campaign-id (merge campaign { status: "paused" }))
         (ok true)
     )
@@ -1114,7 +1112,10 @@
         )
         (asserts! (> voting-period u0) err-invalid-duration)
         (asserts! (<= voting-period u14400) err-invalid-duration)
-        ;; Max 100 days
+        (asserts! (<= (len title) u100) err-invalid-title)
+        (asserts! (<= (len description) u500) err-invalid-description)
+        (asserts! (<= (len proposal-type) u50) err-invalid-category)
+        (asserts! (<= target-value u1000000000000) err-invalid-amount)
 
         (map-set governance-proposals proposal-id {
             proposer: tx-sender,
@@ -1241,7 +1242,8 @@
             (or (is-eq tx-sender contract-owner) (get can-manage-governance permissions))
             err-owner-only
         )
-
+        (asserts! (<= power u1000000000000) err-invalid-amount)
+        ;; Max 1M STX voting power
         (map-set user-voting-power user power)
         (ok true)
     )
