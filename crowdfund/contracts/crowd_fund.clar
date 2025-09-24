@@ -145,6 +145,62 @@
     }
 )
 
+;; Advanced Campaign Features - Milestones, Extensions, Enhanced Refunds
+
+;; Additional Constants
+(define-constant err-milestone-not-found (err u111))
+(define-constant err-milestone-already-reached (err u112))
+(define-constant err-milestone-not-reached (err u113))
+(define-constant err-extension-limit-exceeded (err u114))
+(define-constant err-cannot-extend (err u115))
+
+;; Additional Data Variables
+(define-data-var milestone-counter uint u0)
+(define-data-var withdrawal-delay uint u144) ;; 1 day default
+
+;; Advanced Data Maps
+(define-map milestones
+    uint
+    {
+        campaign-id: uint,
+        title: (string-ascii 100),
+        description: (string-ascii 300),
+        target-amount: uint,
+        target-block: uint,
+        is-reached: bool,
+        funds-released: uint,
+    }
+)
+
+(define-map campaign-milestones
+    uint
+    (list 10 uint)
+)
+
+(define-map refund-requests
+    {
+        campaign-id: uint,
+        contributor: principal,
+    }
+    {
+        amount: uint,
+        requested-block: uint,
+        reason: (string-ascii 200),
+    }
+)
+
+(define-map campaign-updates
+    uint
+    (list
+        20
+        {
+            update-block: uint,
+            title: (string-ascii 100),
+            content: (string-ascii 500),
+        }
+    )
+)
+
 ;; Input Validation Functions
 (define-private (is-valid-title (title (string-ascii 100)))
     (and
@@ -687,4 +743,125 @@
 
         (ok contribution)
     )
+)
+
+;; Milestone Management
+(define-public (create-milestone
+        (campaign-id uint)
+        (title (string-ascii 100))
+        (description (string-ascii 300))
+        (target-amount uint)
+        (target-block uint)
+    )
+    (let (
+            (campaign (unwrap! (map-get? campaigns campaign-id) err-not-found))
+            (milestone-id (+ (var-get milestone-counter) u1))
+            (current-milestones (get-campaign-milestones campaign-id))
+        )
+        (asserts! (is-eq tx-sender (get creator campaign)) err-unauthorized)
+        (asserts! (is-campaign-active campaign-id) err-campaign-ended)
+        (asserts! (> target-amount u0) err-invalid-amount)
+        (asserts! (< (len current-milestones) u10) err-extension-limit-exceeded)
+
+        (map-set milestones milestone-id {
+            campaign-id: campaign-id,
+            title: title,
+            description: description,
+            target-amount: target-amount,
+            target-block: target-block,
+            is-reached: false,
+            funds-released: u0,
+        })
+
+        (map-set campaign-milestones campaign-id
+            (unwrap-panic (as-max-len? (append current-milestones milestone-id) u10))
+        )
+
+        (var-set milestone-counter milestone-id)
+        (ok milestone-id)
+    )
+)
+
+(define-public (extend-campaign
+        (campaign-id uint)
+        (extension-blocks uint)
+    )
+    (let (
+            (campaign (unwrap! (map-get? campaigns campaign-id) err-not-found))
+            (extensions-used (get extensions-used campaign))
+        )
+        (asserts! (is-eq tx-sender (get creator campaign)) err-unauthorized)
+        (asserts! (is-campaign-active campaign-id) err-campaign-ended)
+        (asserts! (< extensions-used (get max-extensions campaign))
+            err-extension-limit-exceeded
+        )
+
+        (map-set campaigns campaign-id
+            (merge campaign {
+                end-block: (+ (get end-block campaign) extension-blocks),
+                extensions-used: (+ extensions-used u1),
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (request-refund
+        (campaign-id uint)
+        (reason (string-ascii 200))
+    )
+    (let (
+            (campaign (unwrap! (map-get? campaigns campaign-id) err-not-found))
+            (contribution (get-contribution campaign-id tx-sender))
+        )
+        (asserts! (> contribution u0) err-insufficient-funds)
+        (asserts! (is-campaign-active campaign-id) err-campaign-ended)
+
+        (map-set refund-requests {
+            campaign-id: campaign-id,
+            contributor: tx-sender,
+        } {
+            amount: contribution,
+            requested-block: stacks-block-height,
+            reason: reason,
+        })
+        (ok true)
+    )
+)
+
+(define-public (post-update
+        (campaign-id uint)
+        (title (string-ascii 100))
+        (content (string-ascii 500))
+    )
+    (let (
+            (campaign (unwrap! (map-get? campaigns campaign-id) err-not-found))
+            (current-updates (get-campaign-updates campaign-id))
+            (new-update {
+                update-block: stacks-block-height,
+                title: title,
+                content: content,
+            })
+        )
+        (asserts! (is-eq tx-sender (get creator campaign)) err-unauthorized)
+        (asserts! (< (len current-updates) u20) err-extension-limit-exceeded)
+
+        (map-set campaign-updates campaign-id
+            (unwrap-panic (as-max-len? (append current-updates new-update) u20))
+        )
+        (ok true)
+    )
+)
+
+;; Read-only functions for advanced features
+(define-read-only (get-milestone (milestone-id uint))
+    (map-get? milestones milestone-id)
+)
+
+(define-read-only (get-campaign-milestones (campaign-id uint))
+    (default-to (list) (map-get? campaign-milestones campaign-id))
+)
+
+(define-read-only (get-campaign-updates (campaign-id uint))
+    (default-to (list) (map-get? campaign-updates campaign-id))
 )
