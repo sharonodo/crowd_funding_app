@@ -207,7 +207,3 @@ Users can participate in platform governance by:
 - Mobile app integration
 
 ---
-
-**License**: MIT
-**Version**: 1.0.0
-**Stacks Network**: Compatible with Stacks 2.0+
